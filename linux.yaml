@@ -1,0 +1,272 @@
+Mappings:
+    RegionMap:
+      us-west-1:
+       "AMI": "ami-02541b8af977f6cdd"
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16 
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: test
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: test
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: test
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: LUIT Project Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP from 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+
+      VpcId: !Ref VPC
+
+# Define Resources that will be launched via this template
+  # EC2 Server Instance Definition
+  JenkinsInstance:
+    Description: Jenkins Standalone EC2 Instance running Java 8, and Jenkins.
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        # configSets is used when there are multiple configs that you want to run, for multiple instances. If not needed then just config (default) is adequate.
+        configSets:
+          default: [mountVolume, config, jenkinsConfig]
+        # This configSet will define how we handle the additional EBS volume that we create with the Instance. We will mount the volume in /var/lib/Jenkins
+        mountVolume:
+          commands:
+            01_mkdir:
+              command: sudo mkdir -p /var/lib/jenkins
+            02_fdisk:
+              command: echo -e "o\nn\np\n1\n\n\nw" | sudo fdisk /dev/sdb
+            03_wait:
+              command: sleep 3
+            04_mkfs:
+              command: sudo mkfs.ext4 /dev/sdb1
+            05_disk_label:
+              command: e2label /dev/sdb1 JENKINS
+            06_fstab:
+              command: echo -e "LABEL=JENKINS     /var/lib/jenkins    ext4   defaults 0 0" >> /etc/fstab
+            07_mount:
+              command: mount -a
+
+        # This configSet will perform the actual installation of Jenkins
+        jenkinsConfig:
+          packages:
+            yum:
+              wget: []
+              java-1.8.0-openjdk: []
+              java-1.8.0-openjdk-devel: []
+              net-tools: []
+              git: []
+              jq: []
+          commands:
+            01_epel_repo:
+              command: sudo rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            02_jenkins_repo:
+              command: sudo wget -O /etc/yum.repos.d/jenkins.repo http://pkg.jenkins-ci.org/redhat/jenkins.repo
+            03_yum_clean:
+              command: yum clean all
+            04_jenkins_key:
+              command: sudo rpm --import https://jenkins-ci.org/redhat/jenkins-ci.org.key
+            05_jenkins_dirs:
+              command: sudo mkdir -p /home/jenkins /var/lib/jenkins/.ssh /var/cache/jenkins/war /var/log/jenkins
+            06_jenkins_install:
+              command: sudo yum install -y jenkins
+            07_check_jenkins_login:
+              command: usermod -s /bin/bash jenkins
+            08_set_jenkins_port:
+              command: !Sub |
+                sudo sed -i "s/JENKINS_PORT=\"8080\"/JENKINS_PORT=\"8080\"/g" /etc/sysconfig/jenkins
+            09_sshconfig:
+              command: sudo echo -e "Host *\n\tStrictHostKeyChecking no\n" >> /var/lib/jenkins/.ssh/config
+            10_ssh_keygen:
+              command: sudo ssh-keygen -t rsa -b 2048 -C jenkins@jenkins -N "" -f /var/lib/jenkins/.ssh/id_rsa; sudo cat /var/lib/jenkins/.ssh/id_rsa.pub > /var/lib/jenkins/.ssh/authorized_keys
+            11_set_permissions:
+              command: sudo chown -R jenkins:jenkins /home/jenkins /var/lib/jenkins /var/cache/jenkins /var/log/jenkins; sudo chmod 0700 /var/lib/jenkins/.ssh; sudo chmod 0600 /var/lib/jenkins/.ssh/*
+            12_firewall:
+              command: !Sub |
+                sudo firewall-cmd --permanent --add-service=ssh; sudo firewall-cmd --permanent --add-port=8080/tcp; sudo firewall-cmd --reload
+          services:
+            sysvinit:
+              jenkins:
+                enabled: true
+                ensureRunning: true
+
+        # Default Config, which handles installing the firewall, and CFN components to talk back to CloudFormation
+        config:
+          packages:
+            yum:
+              firewalld: []
+          commands:
+            01_update:
+              command: yum -y update
+          files:
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.JenkinsInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=JenkinsInstance
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - '/etc/cfn/cfn-hup.conf'
+                  - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+              firewalld:
+                enabled: true
+                ensureRunning: true
+
+    # Properties of the Instance that we are launching. Here we define things like EBS volumes, SG's, The AMI used, etc..
+    Properties:
+      # Create the 25GB EBS volume that we will use for /var/lib/jenkins
+        BlockDeviceMappings:
+          - DeviceName: /dev/sdb
+            Ebs:
+              DeleteOnTermination: false
+              VolumeType: gp2
+              VolumeSize: 20
+      # Pull the Image or AMI from the RegionMap Map we defined earlier
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+        InstanceType: t2.micro
+        
+        SubnetId: !Ref PublicSubnet1
+        SecurityGroupIds: 
+          - !Ref WebServerSecurityGroup
+        KeyName: cloudformation-key
+        Tags:
+        - Key: Name
+          Value: test
+      # Use the user data to instantiate the cfn service, which will report back to CloudFormaton once the instance is set up
+        UserData:
+          Fn::Base64: !Sub |     # No more Fn::Join needed
+            #!/bin/bash -x
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource JenkinsInstance --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource JenkinsInstance
+            cd /var/lib/jenkins
+            sudo -u jenkins touch jenkins.install.UpgradeWizard.state 
+            sudo chmod 777 jenkins.install.UpgradeWizard.state
+            sudo -u jenkins echo "2.0" >> jenkins.install.UpgradeWizard.state
+            sudo -u jenkins mkdir init.groovy.d; cd init.groovy.d
+            sudo -u jenkins touch basic-security.groovy
+            sudo chmod 777 basic-security.groovy
+
+            cat << EOF >> basic-security.groovy
+            #!groovy
+
+            import jenkins.model.*
+            import hudson.security.*
+
+            def instance = Jenkins.getInstance()
+
+            println "--> creating local user 'admin'"
+
+            def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+            hudsonRealm.createAccount('admin','admin')
+            instance.setSecurityRealm(hudsonRealm)
+
+            def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+            instance.setAuthorizationStrategy(strategy)
+            instance.save()
+            EOF
+
+            sudo systemctl restart jenkins
+
+            cd /
+            sudo git clone https://mydemo-at-409059319302:Ighwx0R0VWuNLpv4AR1UOJQOgTXzwiJesDN8seVca8o=@git-codecommit.us-west-1.amazonaws.com/v1/repos/test-repo1
+            cd test-repo1
+
+            sudo wget http://localhost:8080/jnlpJars/jenkins-cli.jar
+
+            sudo chmod 777 jenkins-cli.jar
+
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket install-plugin workflow-job
+
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket install-plugin workflow-aggregator
+
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket install-plugin Git
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket install-plugin github
+
+            sudo systemctl restart jenkins
+
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket create-job demo-pipe2 < job.xml
+            java -jar jenkins-cli.jar -s http://localhost:8080/ -auth 'admin:admin' -webSocket build demo-pipe2
+           
+      # Creation Policy will ensure that if the instance isn't complete within the specified window, that a rollback will occur
+    CreationPolicy:
+      ResourceSignal:
+        Count: '1'
+        Timeout: PT15M
+
